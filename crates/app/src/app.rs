@@ -24,7 +24,7 @@ use nook_ui::bento;
 use nook_ui::geometry::Squircle;
 use nook_ui::module::{Badge, Module, Registry};
 use nook_ui::paint;
-use nook_ui::shell::{Shell, ShellMetrics, ShellOutput};
+use nook_ui::shell::{Dock, OpenOn, Shell, ShellMetrics, ShellOutput, WindowMode};
 use nook_ui::shell_state::ShellTimings;
 use nook_ui::theme::{self, FALLBACK_ACCENT, SIZE_BODY, SIZE_LABEL, Theme, ThemeMode};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -117,6 +117,8 @@ pub struct NookApp {
     trimmed: bool,
     /// Window rect in physical pixels: (x, y, w, h).
     anchor: Option<(i32, i32, i32, i32)>,
+    /// The window rect the pointer was last reported against.
+    input_anchor: Option<(i32, i32, i32, i32)>,
     activatable: bool,
     /// GitHub release checks and the in-place update.
     updater: Updater,
@@ -240,7 +242,7 @@ impl NookApp {
             cfg.usage_stats,
             builtin,
         );
-        Ok(Self {
+        let mut app = Self {
             cfg,
             hwnd,
             shell,
@@ -273,13 +275,32 @@ impl NookApp {
             collapsed_since: None,
             trimmed: false,
             anchor: None,
+            input_anchor: None,
             activatable: false,
             updater,
             stats,
             _instance: instance,
             #[cfg(feature = "debug-overlay")]
             overlay: Default::default(),
-        })
+        };
+        app.sync_shell_cfg();
+        Ok(app)
+    }
+
+    /// Pushes the position and open-on settings to the shell and the tray.
+    fn sync_shell_cfg(&mut self) {
+        let cfg = &self.cfg;
+        self.shell.placement = cfg.placement;
+        self.shell.dock = cfg.dock;
+        self.shell.dock_y = cfg.dock_y.clamp(0.0, 1.0);
+        self.shell.free = cfg
+            .free_placed
+            .then(|| (cfg.free_x.clamp(0.0, 1.0), cfg.free_y.clamp(0.0, 1.0)));
+        self.shell.state.click_only = cfg.open_on == OpenOn::Click;
+        if let Some(t) = &self.tray {
+            t.set_dock(cfg.dock);
+            t.set_click_open(cfg.open_on == OpenOn::Click);
+        }
     }
 
     fn dark(&self) -> bool {
@@ -400,6 +421,30 @@ impl NookApp {
                 self.cfg.launch_at_startup = !self.cfg.launch_at_startup;
                 self.apply_startup();
             }
+            TrayCommand::DockLeft | TrayCommand::DockRight => {
+                let side = if cmd == TrayCommand::DockLeft {
+                    Dock::Left
+                } else {
+                    Dock::Right
+                };
+                self.cfg.dock = if self.cfg.dock == side { Dock::Off } else { side };
+                self.sync_shell_cfg();
+                self.save_config();
+            }
+            TrayCommand::ToggleClickOpen => {
+                self.cfg.open_on = match self.cfg.open_on {
+                    OpenOn::Hover => OpenOn::Click,
+                    OpenOn::Click => OpenOn::Hover,
+                };
+                self.sync_shell_cfg();
+                self.save_config();
+            }
+            TrayCommand::ResetPosition => {
+                self.cfg.free_placed = false;
+                self.cfg.dock_y = crate::config::DEFAULT_DOCK_Y;
+                self.sync_shell_cfg();
+                self.save_config();
+            }
             TrayCommand::Update => self.updater.install(),
             TrayCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -423,8 +468,32 @@ impl NookApp {
             return;
         };
         let scale = window::dpi(self.hwnd) as f32 / 96.0;
-        let h = (self.shell.window_size().y * scale).ceil() as i32;
-        let rect = (mon.work.left, mon.work.top, mon.work.width(), h);
+        // A notch on the top edge needs only a strip. One that was dragged
+        // or docked gets a window just big enough for where it rests, and
+        // the whole work area only while it is being dragged or travelling:
+        // a screen-sized window makes the compositor blur a screen-sized
+        // area, which starves the GPU and lags the whole desktop.
+        let work = mon.work;
+        let rect = match self.shell.window_mode() {
+            WindowMode::Strip => {
+                let h = (self.shell.window_size().y * scale).ceil() as i32;
+                (work.left, work.top, work.width(), h)
+            }
+            WindowMode::Full => (work.left, work.top, work.width(), work.height()),
+            WindowMode::Tight => {
+                let area = Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(work.width() as f32 / scale, work.height() as f32 / scale),
+                );
+                let r = self.shell.rest_bounds(area);
+                (
+                    work.left + (r.min.x * scale).floor() as i32,
+                    work.top + (r.min.y * scale).floor() as i32,
+                    ((r.width() * scale).ceil() as i32).max(1),
+                    ((r.height() * scale).ceil() as i32).max(1),
+                )
+            }
+        };
         if self.anchor != Some(rect) {
             match window::set_rect(self.hwnd, rect.0, rect.1, rect.2, rect.3) {
                 Ok(()) => {
@@ -577,6 +646,20 @@ impl NookApp {
             }
             hit.set_shape(HitShape { polygons });
         }
+        // With a screen-sized window, only the drawn shape can be covered.
+        let cover = shape.filter(|_| self.shell.window_mode() == WindowMode::Full).map(|s| {
+            let (ox, oy) = self
+                .anchor
+                .map(|(x, y, _, _)| (x as f32, y as f32))
+                .unwrap_or_default();
+            (
+                (ox + s.rect.min.x * ppp) as i32,
+                (oy + s.rect.min.y * ppp) as i32,
+                (s.rect.width() * ppp) as i32,
+                (s.rect.height() * ppp) as i32,
+            )
+        });
+        window::set_cover_rect(cover);
         self.pushed = Some((outline, extra));
         self.shape_dirty = false;
     }
@@ -1116,6 +1199,21 @@ impl eframe::App for NookApp {
             (typing && ctx.input(|i| i.focused)) || ctx.input(|i| !i.raw.hovered_files.is_empty());
         self.route_dropped_files(&ctx);
         self.shell.expanded_override = self.page_size(&ctx);
+        // The work area, and where the (possibly smaller) window sits in it.
+        let ppp = ctx.pixels_per_point();
+        match (self.sys.monitor, self.anchor) {
+            (Some(mon), Some((ax, ay, _, _))) => {
+                self.shell.area = Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(mon.work.width() as f32 / ppp, mon.work.height() as f32 / ppp),
+                ));
+                self.shell.origin = vec2(
+                    (ax - mon.work.left) as f32 / ppp,
+                    (ay - mon.work.top) as f32 / ppp,
+                );
+            }
+            _ => self.shell.area = None,
+        }
         let registry = &mut self.registry;
         let cfg = &mut self.cfg;
         let out = self.shell.show(
@@ -1174,6 +1272,17 @@ impl eframe::App for NookApp {
             },
         );
 
+        if out.moved {
+            // Dropped after a drag: remember where.
+            if self.shell.dock.is_on() {
+                self.cfg.dock_y = self.shell.dock_y;
+            } else if let Some((x, y)) = self.shell.free {
+                self.cfg.free_placed = true;
+                self.cfg.free_x = x;
+                self.cfg.free_y = y;
+            }
+            self.save_config();
+        }
         if let Some(id) = clicked {
             self.stats.tool(id);
         }
@@ -1220,7 +1329,7 @@ impl eframe::App for NookApp {
         }
         if settings_out.changed {
             self.shell.timings = timings(&self.cfg);
-            self.shell.placement = self.cfg.placement;
+            self.sync_shell_cfg();
             self.watcher.set_monitor_mode(self.cfg.monitor);
             nook_modules::plugins::set_dev_mode(self.cfg.plugin_dev);
             self.stats.set_enabled(self.cfg.usage_stats);
@@ -1302,6 +1411,23 @@ impl eframe::App for NookApp {
             )));
         }
         self.was_inside = inside;
+        // The window moved or resized (it changes size as the notch is
+        // dragged and dropped): egui still holds the pointer in the old
+        // window's coordinates and no mouse move may follow, so say where
+        // the cursor really is.
+        if self.input_anchor != self.anchor {
+            self.input_anchor = self.anchor;
+            if inside
+                && let (Ok((x, y)), Some((ox, oy, _, _))) =
+                    (nook_platform::monitor::cursor_pos(), self.anchor)
+            {
+                let ppp = ctx.pixels_per_point();
+                raw.events.push(egui::Event::PointerMoved(pos2(
+                    (x - ox) as f32 / ppp,
+                    (y - oy) as f32 / ppp,
+                )));
+            }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
